@@ -119,6 +119,7 @@ impl Command {
 
         Ok(process_handle)
     }
+
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -194,6 +195,8 @@ impl Process {
         }
         Ok(Some(ExitStatus(proc_info.return_code)))
     }
+
+    pub fn handle(&self) ->  &FileDesc { unimplemented!(); }
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]

@@ -5,6 +5,8 @@ use crate::sys;
 use crate::sys::cvt;
 use crate::sys::process::process_common::*;
 use crate::sys_common::thread;
+use crate::sys::vxworks::pipe::AnonPipe;
+use crate::sys::vxworks::fd::FileDesc;
 
 ////////////////////////////////////////////////////////////////////////////////
 // Command
@@ -21,7 +23,7 @@ impl Command {
                                       "nul byte found in provided data"));
         }
         let (ours, theirs) = self.setup_io(default, needs_stdin)?;
-        let mut p = Process { pid: 0, status: None };
+       // let mut p = Process { pid: 0, status: None, death_rx:  };
 
         unsafe {
             macro_rules! t {
@@ -52,6 +54,13 @@ impl Command {
                 t!(cvt(libc::chdir(cwd.as_ptr())));
             }
 
+            let (death_rx, death_tx) = sys::pipe::anon_pipe()?;
+            // the anonpipe has been created with CLOEXEC, and would be closed when rtpSpawn is
+            // invoked. Therefor we place a duplicate into the process context,
+            // without CLOEXEC-flag. This fd will 'leak' into the child-process, occupying a
+            // file-descriptor slot.
+            let _death_tx = cvt_r(|| libc::dup(death_tx.fd().raw()))?;
+
             let ret = libc::rtpSpawn(
                 self.get_argv()[0],                   // executing program
                 self.get_argv().as_ptr() as *mut *const c_char, // argv
@@ -78,8 +87,7 @@ impl Command {
             }
 
             if ret != libc::RTP_ID_ERROR {
-                p.pid = ret;
-                Ok((p, ours))
+                Ok((Process { pid: ret, status: None, death_rx: death_rx }, ours))
             } else {
                 Err(io::Error::last_os_error())
             }
@@ -107,6 +115,7 @@ impl Command {
 pub struct Process {
     pid: RTP_ID,
     status: Option<ExitStatus>,
+    death_rx: AnonPipe,
 }
 
 impl Process {
@@ -152,4 +161,6 @@ impl Process {
             Ok(Some(ExitStatus::new(status)))
         }
     }
+
+    pub fn handle(&self) ->  &FileDesc { &self.death_rx.fd() }
 }

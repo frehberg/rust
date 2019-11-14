@@ -151,4 +151,6 @@ impl Process {
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         match self.0 {}
     }
+
+    pub fn handle(&self) -> &FileDesc { unimplemented!(); }
 }

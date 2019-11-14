@@ -4,6 +4,8 @@ use crate::ptr;
 use crate::sys::cvt;
 use crate::sys::process::process_common::*;
 use crate::sys;
+use crate::sys::unix::pipe::AnonPipe;
+use crate::sys::unix::fd::FileDesc;
 
 use libc::{c_int, gid_t, pid_t, uid_t};
 
@@ -14,6 +16,8 @@ use libc::{c_int, gid_t, pid_t, uid_t};
 impl Command {
     pub fn spawn(&mut self, default: Stdio, needs_stdin: bool)
                  -> io::Result<(Process, StdioPipes)> {
+        use crate::sys::{self, cvt_r};
+
         const CLOEXEC_MSG_FOOTER: &[u8] = b"NOEX";
 
         let envp = self.capture_env();
@@ -25,11 +29,8 @@ impl Command {
 
         let (ours, theirs) = self.setup_io(default, needs_stdin)?;
 
-        if let Some(ret) = self.posix_spawn(&theirs, envp.as_ref())? {
-            return Ok((ret, ours))
-        }
-
         let (input, output) = sys::pipe::anon_pipe()?;
+        let (death_rx, death_tx) = sys::pipe::anon_pipe()?;
 
         // Whatever happens after the fork is almost for sure going to touch or
         // look at the environment in one way or another (PATH in `execvp` or
@@ -48,6 +49,14 @@ impl Command {
             match result {
                 0 => {
                     drop(input);
+                    // close death_rx and inherit death_tx to sub-process
+                    drop(death_rx);
+                    // the anonpipe has been created with CLOEXEC, and would be closed when execve is
+                    // invoked. Therefor we place a duplicate into the process context,
+                    // without CLOEXEC-flag. This fd will 'leak' into the child-process, occupying a
+                    // file-descriptor slot.
+                    let _death_tx = cvt_r(|| libc::dup(death_tx.fd().raw()))?;
+
                     let Err(err) = self.do_exec(theirs, envp.as_ref());
                     let errno = err.raw_os_error().unwrap_or(libc::EINVAL) as u32;
                     let bytes = [
@@ -68,7 +77,7 @@ impl Command {
             }
         };
 
-        let mut p = Process { pid: pid, status: None };
+        let mut p = Process { pid: pid, status: None, death_rx: death_rx };
         drop(output);
         let mut bytes = [0; 8];
 
@@ -252,140 +261,6 @@ impl Command {
         Err(io::Error::last_os_error())
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "freebsd",
-                  all(target_os = "linux", target_env = "gnu"))))]
-    fn posix_spawn(&mut self, _: &ChildPipes, _: Option<&CStringArray>)
-        -> io::Result<Option<Process>>
-    {
-        Ok(None)
-    }
-
-    // Only support platforms for which posix_spawn() can return ENOENT
-    // directly.
-    #[cfg(any(target_os = "macos", target_os = "freebsd",
-              all(target_os = "linux", target_env = "gnu")))]
-    fn posix_spawn(&mut self, stdio: &ChildPipes, envp: Option<&CStringArray>)
-        -> io::Result<Option<Process>>
-    {
-        use crate::mem::MaybeUninit;
-        use crate::sys;
-
-        if self.get_gid().is_some() ||
-            self.get_uid().is_some() ||
-            self.env_saw_path() ||
-            !self.get_closures().is_empty() {
-            return Ok(None)
-        }
-
-        // Only glibc 2.24+ posix_spawn() supports returning ENOENT directly.
-        #[cfg(all(target_os = "linux", target_env = "gnu"))]
-        {
-            if let Some(version) = sys::os::glibc_version() {
-                if version < (2, 24) {
-                    return Ok(None)
-                }
-            } else {
-                return Ok(None)
-            }
-        }
-
-        // Solaris and glibc 2.29+ can set a new working directory, and maybe
-        // others will gain this non-POSIX function too. We'll check for this
-        // weak symbol as soon as it's needed, so we can return early otherwise
-        // to do a manual chdir before exec.
-        weak! {
-            fn posix_spawn_file_actions_addchdir_np(
-                *mut libc::posix_spawn_file_actions_t,
-                *const libc::c_char
-            ) -> libc::c_int
-        }
-        let addchdir = match self.get_cwd() {
-            Some(cwd) => match posix_spawn_file_actions_addchdir_np.get() {
-                Some(f) => Some((f, cwd)),
-                None => return Ok(None),
-            },
-            None => None,
-        };
-
-        let mut p = Process { pid: 0, status: None };
-
-        struct PosixSpawnFileActions(MaybeUninit<libc::posix_spawn_file_actions_t>);
-
-        impl Drop for PosixSpawnFileActions {
-            fn drop(&mut self) {
-                unsafe {
-                    libc::posix_spawn_file_actions_destroy(self.0.as_mut_ptr());
-                }
-            }
-        }
-
-        struct PosixSpawnattr(MaybeUninit<libc::posix_spawnattr_t>);
-
-        impl Drop for PosixSpawnattr {
-            fn drop(&mut self) {
-                unsafe {
-                    libc::posix_spawnattr_destroy(self.0.as_mut_ptr());
-                }
-            }
-        }
-
-        unsafe {
-            let mut file_actions = PosixSpawnFileActions(MaybeUninit::uninit());
-            let mut attrs = PosixSpawnattr(MaybeUninit::uninit());
-
-            libc::posix_spawnattr_init(attrs.0.as_mut_ptr());
-            libc::posix_spawn_file_actions_init(file_actions.0.as_mut_ptr());
-
-            if let Some(fd) = stdio.stdin.fd() {
-                cvt(libc::posix_spawn_file_actions_adddup2(file_actions.0.as_mut_ptr(),
-                                                           fd,
-                                                           libc::STDIN_FILENO))?;
-            }
-            if let Some(fd) = stdio.stdout.fd() {
-                cvt(libc::posix_spawn_file_actions_adddup2(file_actions.0.as_mut_ptr(),
-                                                           fd,
-                                                           libc::STDOUT_FILENO))?;
-            }
-            if let Some(fd) = stdio.stderr.fd() {
-                cvt(libc::posix_spawn_file_actions_adddup2(file_actions.0.as_mut_ptr(),
-                                                           fd,
-                                                           libc::STDERR_FILENO))?;
-            }
-            if let Some((f, cwd)) = addchdir {
-                cvt(f(file_actions.0.as_mut_ptr(), cwd.as_ptr()))?;
-            }
-
-            let mut set = MaybeUninit::<libc::sigset_t>::uninit();
-            cvt(sigemptyset(set.as_mut_ptr()))?;
-            cvt(libc::posix_spawnattr_setsigmask(attrs.0.as_mut_ptr(),
-                                                 set.as_ptr()))?;
-            cvt(sigaddset(set.as_mut_ptr(), libc::SIGPIPE))?;
-            cvt(libc::posix_spawnattr_setsigdefault(attrs.0.as_mut_ptr(),
-                                                    set.as_ptr()))?;
-
-            let flags = libc::POSIX_SPAWN_SETSIGDEF |
-                libc::POSIX_SPAWN_SETSIGMASK;
-            cvt(libc::posix_spawnattr_setflags(attrs.0.as_mut_ptr(), flags as _))?;
-
-            // Make sure we synchronize access to the global `environ` resource
-            let _env_lock = sys::os::env_lock();
-            let envp = envp.map(|c| c.as_ptr())
-                .unwrap_or_else(|| *sys::os::environ() as *const _);
-            let ret = libc::posix_spawnp(
-                &mut p.pid,
-                self.get_argv()[0],
-                file_actions.0.as_ptr(),
-                attrs.0.as_ptr(),
-                self.get_argv().as_ptr() as *const _,
-                envp as *const _,
-            );
-            if ret == 0 {
-                Ok(Some(p))
-            } else {
-                Err(io::Error::from_raw_os_error(ret))
-            }
-        }
-    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -396,6 +271,7 @@ impl Command {
 pub struct Process {
     pid: pid_t,
     status: Option<ExitStatus>,
+    death_rx: AnonPipe,
 }
 
 impl Process {
@@ -441,6 +317,8 @@ impl Process {
             Ok(Some(ExitStatus::new(status)))
         }
     }
+
+    pub fn handle(&self) ->  &FileDesc { &self.death_rx.fd() }
 }
 
 /// Unix exit statuses
