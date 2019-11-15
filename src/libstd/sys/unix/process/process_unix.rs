@@ -79,6 +79,9 @@ impl Command {
 
         let mut p = Process { pid: pid, status: None, death_rx: death_rx };
         drop(output);
+        // In parent-process free the death-tx
+        drop(death_tx);
+
         let mut bytes = [0; 8];
 
         // loop to handle EINTR

@@ -71,6 +71,9 @@ impl Command {
                 0                                     // task options
             );
 
+            // In parent-process free the death-tx
+            drop(death_tx);
+
             // Because FileDesc was not used, each duplicated file descriptor
             // needs to be closed manually
             if orig_stdin != libc::STDIN_FILENO {
